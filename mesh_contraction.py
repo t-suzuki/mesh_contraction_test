@@ -5,10 +5,13 @@
 #
 # solve [WL*L; WH] * V' = [0; WH*V] iteratively.
 
-import collections
 import numpy as np
+import scipy.sparse
+import scipy.sparse.linalg
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+
+use_sparse = True
 
 def generate_model(sigma = 0.1):
     # 0---1---2---3
@@ -16,8 +19,8 @@ def generate_model(sigma = 0.1):
     #   4---5---6--7
     #  / \ / \ / \ /
     # 8---9---a---b
-    nrows = 10
-    ncols = 4
+    nrows = 5
+    ncols = 20
     nodes = []
     faces = []
     for irow in range(nrows):
@@ -59,7 +62,6 @@ def plot_model(nodes, faces, color, ax = None):
                 [nodes[i0, 1], nodes[i1, 1], nodes[i2, 1], nodes[i0, 1]],
                 [nodes[i0, 2], nodes[i1, 2], nodes[i2, 2], nodes[i0, 2]],
                 '-', alpha=0.5, color='gray')
-    ax.set_aspect('equal')
     return ax
 
 def cot(nodes, i0, i1, i2):
@@ -68,30 +70,17 @@ def cot(nodes, i0, i1, i2):
     return 1.0 / np.tan(np.arccos(h0.dot(h1) / (np.linalg.norm(h0) * np.linalg.norm(h1))))
 
 def Laplacian(nodes, faces):
-    faces_lookup = collections.defaultdict(set)
-    for i0, i1, i2 in faces:
-        faces_lookup[i0, i1].add(i2)
-        faces_lookup[i1, i2].add(i0)
-        faces_lookup[i2, i0].add(i1)
-        faces_lookup[i1, i0].add(i2)
-        faces_lookup[i2, i1].add(i0)
-        faces_lookup[i0, i2].add(i1)
     n = nodes.shape[0]
     L = np.zeros((3 * n, 3 * n))
-    # non-diag
-    for i in range(n):
-        for j in range(n):
-            if (i, j) in faces_lookup.keys():
-                lookup = faces_lookup[i, j]
-                if len(lookup) == 2:
-                    alpha, beta = lookup
-                    L_ij = cot(nodes, i, j, alpha) + cot(nodes, i, j, beta)
-                else:
-                    alpha, = lookup
-                    L_ij = cot(nodes, i, j, alpha)
-                L[3 * i + 0, 3 * j + 0] = L_ij
-                L[3 * i + 1, 3 * j + 1] = L_ij
-                L[3 * i + 2, 3 * j + 2] = L_ij
+    for i0, i1, i2 in faces:
+        for e0, e1, v in [(i0, i1, i2), (i1, i2, i0), (i2, i0, i1)]:
+            L_ij = cot(nodes, e0, e1, v)
+            L[3 * e0 + 0, 3 * e1 + 0] += L_ij
+            L[3 * e0 + 1, 3 * e1 + 1] += L_ij
+            L[3 * e0 + 2, 3 * e1 + 2] += L_ij
+            L[3 * e1 + 0, 3 * e0 + 0] += L_ij
+            L[3 * e1 + 1, 3 * e0 + 1] += L_ij
+            L[3 * e1 + 2, 3 * e0 + 2] += L_ij
     # diag
     for i in range(n):
         L_ii = - L[3 * i + 0, :].sum()
@@ -101,7 +90,8 @@ def Laplacian(nodes, faces):
     #print L
     #plt.imshow(L)
     #plt.show()
-    return L
+    if use_sparse: return scipy.sparse.csc_matrix(L)
+    else:          return L
 
 def one_ring_vector(nodes, faces):
     u'''A[i] = one-ring area for nodes[i].'''
@@ -141,6 +131,7 @@ def make_V(nodes):
     return V
 
 def parse_V(V):
+    V = V.reshape((-1, 1))
     n = V.shape[0] // 3
     return np.vstack([(V[3 * i + 0, 0], V[3 * i + 1, 0], V[3 * i + 2, 0])] for i in range(n))
 
@@ -148,13 +139,16 @@ def contraction_step(nodes, faces, A0, WL, WH0):
     n = nodes.shape[0]
     L = Laplacian(nodes, faces)
     A = one_ring_vector(nodes, faces)
-    WH = WH0 * np.diag(expand3(np.sqrt(A0 / A)))
+    if use_sparse: WH = WH0 * scipy.sparse.diags(expand3(np.sqrt(A0 / A)), 0)
+    else:          WH = WH0 * np.diag(expand3(np.sqrt(A0 / A)), 0)
     V = make_V(nodes)
     # [WL*L; WH] * V' = [0; WH*V]
     Z = np.zeros_like(V)
-    Q = np.vstack([WL*L, WH])
+    if use_sparse: Q = scipy.sparse.vstack([WL*L, WH])
+    else:          Q = np.vstack([WL*L, WH])
     R = np.vstack([Z, WH.dot(V)])
-    newV = np.linalg.lstsq(Q, R)[0]
+    if use_sparse: newV = scipy.sparse.linalg.lsqr(Q, R, show=False)[0]
+    else:          newV = np.linalg.lstsq(Q, R)[0]
     nodes = parse_V(newV)
     return nodes
 
@@ -170,11 +164,12 @@ def contraction(nodes, faces, WL0, sL, n_iter):
     return nodes
 
 if __name__ == '__main__':
+    np.random.seed(0)
     nodes, faces = generate_model(0.1)
     print('n = {}'.format(nodes.shape[0]))
     ax = plot_model(nodes, faces, 'blue')
 
-    n_iter = 13
+    n_iter = 14
     A = average_face_area(nodes, faces)
     WL = 1.0e-3 * A ** 0.5 # from the paper, 1.0e-3 * A^0.5
     print('A = {}, WL_0 = {}'.format(A, WL))
